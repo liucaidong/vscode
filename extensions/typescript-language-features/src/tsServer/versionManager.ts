@@ -32,9 +32,22 @@ export class TypeScriptVersionManager extends Disposable {
 		this._currentVersion = this.versionProvider.defaultVersion;
 
 		if (this.useWorkspaceTsdkSetting) {
-			const localVersion = this.versionProvider.localVersion;
-			if (localVersion) {
-				this._currentVersion = localVersion;
+			if (vscode.workspace.isTrusted) {
+				const localVersion = this.versionProvider.localVersion;
+				if (localVersion) {
+					this._currentVersion = localVersion;
+				}
+			} else {
+				setImmediate(() => {
+					vscode.workspace.requestWorkspaceTrust({ modal: false })
+						.then(trusted => {
+							if (trusted && this.versionProvider.localVersion) {
+								this.updateActiveVersion(this.versionProvider.localVersion);
+							} else {
+								this.updateActiveVersion(this.versionProvider.defaultVersion);
+							}
+						});
+				});
 			}
 		}
 
@@ -86,7 +99,7 @@ export class TypeScriptVersionManager extends Disposable {
 	private getBundledPickItem(): QuickPickItem {
 		const bundledVersion = this.versionProvider.defaultVersion;
 		return {
-			label: (!this.useWorkspaceTsdkSetting
+			label: (!this.useWorkspaceTsdkSetting || !vscode.workspace.isTrusted
 				? '• '
 				: '') + localize('useVSCodeVersionOption', "Use VS Code's Version"),
 			description: bundledVersion.displayName,
@@ -101,16 +114,19 @@ export class TypeScriptVersionManager extends Disposable {
 	private getLocalPickItems(): QuickPickItem[] {
 		return this.versionProvider.localVersions.map(version => {
 			return {
-				label: (this.useWorkspaceTsdkSetting && this.currentVersion.eq(version)
+				label: (this.useWorkspaceTsdkSetting && vscode.workspace.isTrusted && this.currentVersion.eq(version)
 					? '• '
 					: '') + localize('useWorkspaceVersionOption', "Use Workspace Version"),
 				description: version.displayName,
 				detail: version.pathLabel,
 				run: async () => {
-					await this.workspaceState.update(useWorkspaceTsdkStorageKey, true);
-					const tsConfig = vscode.workspace.getConfiguration('typescript');
-					await tsConfig.update('tsdk', version.pathLabel, false);
-					this.updateActiveVersion(version);
+					const trusted = await vscode.workspace.requestWorkspaceTrust({ modal: true });
+					if (trusted) {
+						await this.workspaceState.update(useWorkspaceTsdkStorageKey, true);
+						const tsConfig = vscode.workspace.getConfiguration('typescript');
+						await tsConfig.update('tsdk', version.pathLabel, false);
+						this.updateActiveVersion(version);
+					}
 				},
 			};
 		});

@@ -22,6 +22,9 @@
     "jsonc-parser": "^2.2.1",
     "vscode-nls": "^4.1.1"
   },
+  "workspaceTrust": {
+    "request": "never"
+  },
   "contributes": {
     "languages": [
       {
@@ -40,8 +43,12 @@
           "keybindings.json",
           "extensions.json",
           "argv.json",
-          "profiles.json"
-        ]
+          "profiles.json",
+          ".devcontainer.json"
+        ],
+        "filenamePatterns": [
+					"**/.devcontainer/devcontainer.json"
+				]
       }
     ],
     "jsonValidation": [
@@ -111,11 +118,11 @@
       },
       {
         "fileMatch": "/.devcontainer/devcontainer.json",
-        "url": "./schemas/devContainer.schema.json"
+        "url": "./schemas/devContainer.schema.generated.json"
       },
       {
         "fileMatch": "/.devcontainer.json",
-        "url": "./schemas/devContainer.schema.json"
+        "url": "./schemas/devContainer.schema.generated.json"
       },
       {
         "fileMatch": "%APP_SETTINGS_HOME%/globalStorage/ms-vscode-remote.remote-containers/nameConfigs/*.json",
@@ -128,6 +135,10 @@
     ]
   },
   "devDependencies": {
-    "@types/node": "^12.11.7"
+    "@types/node": "^12.19.9"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/microsoft/vscode.git"
   }
 }

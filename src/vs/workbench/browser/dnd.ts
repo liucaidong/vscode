@@ -9,14 +9,15 @@ import { basename, isEqual } from 'vs/base/common/resources';
 import { IFileService } from 'vs/platform/files/common/files';
 import { IWindowOpenable } from 'vs/platform/windows/common/windows';
 import { URI } from 'vs/base/common/uri';
-import { ITextFileService, stringToSnapshot } from 'vs/workbench/services/textfile/common/textfiles';
+import { ITextFileService } from 'vs/workbench/services/textfile/common/textfiles';
+import { bufferToReadable, VSBuffer } from 'vs/base/common/buffer';
 import { FileAccess, Schemas } from 'vs/base/common/network';
 import { ITextEditorOptions } from 'vs/platform/editor/common/editor';
 import { DataTransfers, IDragAndDropData } from 'vs/base/browser/dnd';
 import { DragMouseEvent } from 'vs/base/browser/mouseEvent';
 import { normalizeDriveLetter } from 'vs/base/common/labels';
 import { MIME_BINARY } from 'vs/base/common/mime';
-import { isWindows, isWeb } from 'vs/base/common/platform';
+import { isWindows } from 'vs/base/common/platform';
 import { ServicesAccessor } from 'vs/platform/instantiation/common/instantiation';
 import { isCodeEditor } from 'vs/editor/browser/editorBrowser';
 import { IEditorIdentifier, GroupIdentifier } from 'vs/workbench/common/editor';
@@ -27,9 +28,9 @@ import { IEditorGroup } from 'vs/workbench/services/editor/common/editorGroupsSe
 import { IWorkspaceEditingService } from 'vs/workbench/services/workspaces/common/workspaceEditing';
 import { withNullAsUndefined } from 'vs/base/common/types';
 import { IHostService } from 'vs/workbench/services/host/browser/host';
-import { isStandalone } from 'vs/base/browser/browser';
-import { IBackupFileService } from 'vs/workbench/services/backup/common/backup';
+import { IWorkingCopyBackupService } from 'vs/workbench/services/workingCopy/common/workingCopyBackup';
 import { Emitter } from 'vs/base/common/event';
+import { NO_TYPE_ID } from 'vs/workbench/services/workingCopy/common/workingCopy';
 
 export interface IDraggedResource {
 	resource: URI;
@@ -111,7 +112,7 @@ export function extractResources(e: DragEvent, externalOnly?: boolean): Array<ID
 		if (e.dataTransfer && e.dataTransfer.files) {
 			for (let i = 0; i < e.dataTransfer.files.length; i++) {
 				const file = e.dataTransfer.files[i];
-				if (file?.path /* Electron only */ && !resources.some(r => r.resource.fsPath === file.path) /* prevent duplicates */) {
+				if (file?.path /* Electron only */ && !resources.some(resource => resource.resource.fsPath === file.path) /* prevent duplicates */) {
 					try {
 						resources.push({ resource: URI.file(file.path), isExternal: true });
 					} catch (error) {
@@ -127,7 +128,7 @@ export function extractResources(e: DragEvent, externalOnly?: boolean): Array<ID
 			try {
 				const codeFiles: string[] = JSON.parse(rawCodeFiles);
 				codeFiles.forEach(codeFile => {
-					if (!resources.some(r => r.resource.fsPath === codeFile) /* prevent duplicates */) {
+					if (!resources.some(resource => resource.resource.fsPath === codeFile) /* prevent duplicates */) {
 						resources.push({ resource: URI.file(codeFile), isExternal: true });
 					}
 				});
@@ -160,7 +161,7 @@ export class ResourcesDropHandler {
 		@IFileService private readonly fileService: IFileService,
 		@IWorkspacesService private readonly workspacesService: IWorkspacesService,
 		@ITextFileService private readonly textFileService: ITextFileService,
-		@IBackupFileService private readonly backupFileService: IBackupFileService,
+		@IWorkingCopyBackupService private readonly workingCopyBackupService: IWorkingCopyBackupService,
 		@IEditorService private readonly editorService: IEditorService,
 		@IWorkspaceEditingService private readonly workspaceEditingService: IWorkspaceEditingService,
 		@IHostService private readonly hostService: IHostService
@@ -168,7 +169,7 @@ export class ResourcesDropHandler {
 	}
 
 	async handleDrop(event: DragEvent, resolveTargetGroup: () => IEditorGroup | undefined, afterDrop: (targetGroup: IEditorGroup | undefined) => void, targetIndex?: number): Promise<void> {
-		const untitledOrFileResources = extractResources(event).filter(r => this.fileService.canHandleResource(r.resource) || r.resource.scheme === Schemas.untitled);
+		const untitledOrFileResources = extractResources(event).filter(resource => this.fileService.canHandleResource(resource.resource) || resource.resource.scheme === Schemas.untitled);
 		if (!untitledOrFileResources.length) {
 			return;
 		}
@@ -246,7 +247,7 @@ export class ResourcesDropHandler {
 		// content and turn it into a backup so that it loads the contents
 		if (typeof droppedDirtyEditor.dirtyContent === 'string') {
 			try {
-				await this.backupFileService.backup(droppedDirtyEditor.resource, stringToSnapshot(droppedDirtyEditor.dirtyContent));
+				await this.workingCopyBackupService.backup({ resource: droppedDirtyEditor.resource, typeId: NO_TYPE_ID }, bufferToReadable(VSBuffer.fromString(droppedDirtyEditor.dirtyContent)));
 			} catch (e) {
 				// Ignore error
 			}
@@ -320,8 +321,7 @@ export function fillResourceDataTransfers(accessor: ServicesAccessor, resources:
 	event.dataTransfer.setData(DataTransfers.TEXT, sources.map(source => source.resource.scheme === Schemas.file ? normalize(normalizeDriveLetter(source.resource.fsPath)) : source.resource.toString()).join(lineDelimiter));
 
 	// Download URL: enables support to drag a tab as file to desktop (only single file supported)
-	// Disabled for PWA web due to: https://github.com/microsoft/vscode/issues/83441
-	if (!sources[0].isDirectory && (!isWeb || !isStandalone)) {
+	if (!sources[0].isDirectory) {
 		event.dataTransfer.setData(DataTransfers.DOWNLOAD_URL, [MIME_BINARY, basename(sources[0].resource), FileAccess.asBrowserUri(sources[0].resource).toString()].join(':'));
 	}
 
@@ -584,7 +584,7 @@ export class CompositeDragAndDropObserver extends Disposable {
 			const id = e.dragAndDropData.getData().id;
 			const type = e.dragAndDropData.getData().type;
 			const data = this.readDragData(type);
-			if (data && data.getData().id === id) {
+			if (data?.getData().id === id) {
 				this.transferData.clearData(type === 'view' ? DraggedViewIdentifier.prototype : DraggedCompositeIdentifier.prototype);
 			}
 		}));
@@ -739,7 +739,7 @@ export class CompositeDragAndDropObserver extends Disposable {
 		if (callbacks.onDragEnd) {
 			this._onDragEnd.event(e => {
 				callbacks.onDragEnd!(e);
-			});
+			}, this, disposableStore);
 		}
 		return this._register(disposableStore);
 	}

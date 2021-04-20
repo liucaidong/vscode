@@ -34,6 +34,7 @@ import { IEditorService } from 'vs/workbench/services/editor/common/editorServic
 import { normalizeDriveLetter } from 'vs/base/common/labels';
 import { SaveReason } from 'vs/workbench/common/editor';
 import { IPathService } from 'vs/workbench/services/path/common/pathService';
+import { IAccessibilityService } from 'vs/platform/accessibility/common/accessibility';
 
 export namespace OpenLocalFileCommand {
 	export const ID = 'workbench.action.files.openLocalFile';
@@ -138,6 +139,7 @@ export class SimpleFileDialog {
 		@IPathService protected readonly pathService: IPathService,
 		@IKeybindingService private readonly keybindingService: IKeybindingService,
 		@IContextKeyService contextKeyService: IContextKeyService,
+		@IAccessibilityService private readonly accessibilityService: IAccessibilityService
 	) {
 		this.remoteAuthority = this.environmentService.remoteAuthority;
 		this.contextKey = RemoteFileDialogContext.bindTo(contextKeyService);
@@ -212,15 +214,22 @@ export class SimpleFileDialog {
 			path = path.replace(/\\/g, '/');
 		}
 		const uri: URI = this.scheme === Schemas.file ? URI.file(path) : URI.from({ scheme: this.scheme, path });
-		return resources.toLocalResource(uri, uri.scheme === Schemas.file ? undefined : this.remoteAuthority, this.pathService.defaultUriScheme);
+		// If the default scheme is file, then we don't care about the remote authority
+		const authority = uri.scheme === Schemas.file ? undefined : this.remoteAuthority;
+		return resources.toLocalResource(uri, authority,
+			// If there is a remote authority, then we should use the system's default URI as the local scheme.
+			// If there is *no* remote authority, then we should use the default scheme for this dialog as that is already local.
+			authority ? this.pathService.defaultUriScheme : uri.scheme);
 	}
 
 	private getScheme(available: readonly string[] | undefined, defaultUri: URI | undefined): string {
-		if (available) {
+		if (available && available.length > 0) {
 			if (defaultUri && (available.indexOf(defaultUri.scheme) >= 0)) {
 				return defaultUri.scheme;
 			}
 			return available[0];
+		} else if (defaultUri) {
+			return defaultUri.scheme;
 		}
 		return Schemas.file;
 	}
@@ -561,7 +570,8 @@ export class SimpleFileDialog {
 				return UpdateResult.InvalidPath;
 			} else {
 				const inputUriDirname = resources.dirname(valueUri);
-				if (!resources.extUriIgnorePathCase.isEqual(resources.removeTrailingPathSeparator(this.currentFolder), inputUriDirname)) {
+				if (!resources.extUriIgnorePathCase.isEqual(resources.removeTrailingPathSeparator(this.currentFolder), inputUriDirname)
+					&& (!/^[a-zA-Z]:$/.test(this.filePickBox.value) || !equalsIgnoreCase(this.pathFromUri(this.currentFolder).substring(0, this.filePickBox.value.length), this.filePickBox.value))) {
 					let statWithoutTrailing: IFileStat | undefined;
 					try {
 						statWithoutTrailing = await this.fileService.resolve(inputUriDirname);
@@ -604,6 +614,7 @@ export class SimpleFileDialog {
 		} else {
 			this.userEnteredPathSegment = inputBasename;
 			this.autoCompletePathSegment = '';
+			this.filePickBox.activeItems = [];
 		}
 	}
 
@@ -635,12 +646,16 @@ export class SimpleFileDialog {
 			return true;
 		} else if (force && (!equalsIgnoreCase(this.basenameWithTrailingSlash(quickPickItem.uri), (this.userEnteredPathSegment + this.autoCompletePathSegment)))) {
 			this.userEnteredPathSegment = '';
-			this.autoCompletePathSegment = this.trimTrailingSlash(itemBasename);
+			if (!this.accessibilityService.isScreenReaderOptimized()) {
+				this.autoCompletePathSegment = this.trimTrailingSlash(itemBasename);
+			}
 			this.activeItem = quickPickItem;
-			this.filePickBox.valueSelection = [this.pathFromUri(this.currentFolder, true).length, this.filePickBox.value.length];
-			// use insert text to preserve undo buffer
-			this.insertText(this.pathAppend(this.currentFolder, this.autoCompletePathSegment), this.autoCompletePathSegment);
-			this.filePickBox.valueSelection = [this.filePickBox.value.length - this.autoCompletePathSegment.length, this.filePickBox.value.length];
+			if (!this.accessibilityService.isScreenReaderOptimized()) {
+				this.filePickBox.valueSelection = [this.pathFromUri(this.currentFolder, true).length, this.filePickBox.value.length];
+				// use insert text to preserve undo buffer
+				this.insertText(this.pathAppend(this.currentFolder, this.autoCompletePathSegment), this.autoCompletePathSegment);
+				this.filePickBox.valueSelection = [this.filePickBox.value.length - this.autoCompletePathSegment.length, this.filePickBox.value.length];
+			}
 			return true;
 		} else {
 			this.userEnteredPathSegment = startingBasename;
@@ -785,13 +800,25 @@ export class SimpleFileDialog {
 
 	private async updateItems(newFolder: URI, force: boolean = false, trailing?: string) {
 		this.busy = true;
-		this.userEnteredPathSegment = trailing ? trailing : '';
 		this.autoCompletePathSegment = '';
-		const newValue = trailing ? this.pathAppend(newFolder, trailing) : this.pathFromUri(newFolder, true);
-		this.currentFolder = resources.addTrailingPathSeparator(newFolder, this.separator);
 
 		const updatingPromise = createCancelablePromise(async token => {
-			return this.createItems(this.currentFolder, token).then(items => {
+			let folderStat: IFileStat | undefined;
+			try {
+				folderStat = await this.fileService.resolve(newFolder);
+				if (!folderStat.isDirectory) {
+					trailing = resources.basename(newFolder);
+					newFolder = resources.dirname(newFolder);
+					folderStat = undefined;
+				}
+			} catch (e) {
+				// The file/directory doesn't exist
+			}
+			const newValue = trailing ? this.pathAppend(newFolder, trailing) : this.pathFromUri(newFolder, true);
+			this.currentFolder = resources.addTrailingPathSeparator(newFolder, this.separator);
+			this.userEnteredPathSegment = trailing ? trailing : '';
+
+			return this.createItems(folderStat, this.currentFolder, token).then(items => {
 				if (token.isCancellationRequested) {
 					this.busy = false;
 					return;
@@ -799,10 +826,9 @@ export class SimpleFileDialog {
 
 				this.filePickBox.items = items;
 				this.filePickBox.activeItems = [<FileQuickPickItem>this.filePickBox.items[0]];
-				if (this.allowFolderSelection) {
-					this.filePickBox.activeItems = [];
-				}
-				// the user might have continued typing while we were updating. Only update the input box if it doesn't matche directory.
+				this.filePickBox.activeItems = [];
+
+				// the user might have continued typing while we were updating. Only update the input box if it doesn't match the directory.
 				if (!equalsIgnoreCase(this.filePickBox.value, newValue) && force) {
 					this.filePickBox.valueSelection = [0, this.filePickBox.value.length];
 					this.insertText(newValue, newValue);
@@ -869,7 +895,7 @@ export class SimpleFileDialog {
 	}
 
 	private createBackItem(currFolder: URI): FileQuickPickItem | null {
-		const fileRepresentationCurr = this.currentFolder.with({ scheme: Schemas.file });
+		const fileRepresentationCurr = this.currentFolder.with({ scheme: Schemas.file, authority: '' });
 		const fileRepresentationParent = resources.dirname(fileRepresentationCurr);
 		if (!resources.isEqual(fileRepresentationCurr, fileRepresentationParent)) {
 			const parentFolder = resources.dirname(currFolder);
@@ -878,12 +904,14 @@ export class SimpleFileDialog {
 		return null;
 	}
 
-	private async createItems(currentFolder: URI, token: CancellationToken): Promise<FileQuickPickItem[]> {
+	private async createItems(folder: IFileStat | undefined, currentFolder: URI, token: CancellationToken): Promise<FileQuickPickItem[]> {
 		const result: FileQuickPickItem[] = [];
 
 		const backDir = this.createBackItem(currentFolder);
 		try {
-			const folder = await this.fileService.resolve(currentFolder);
+			if (!folder) {
+				folder = await this.fileService.resolve(currentFolder);
+			}
 			const items = folder.children ? await Promise.all(folder.children.map(child => this.createItem(child, currentFolder, token))) : [];
 			for (let item of items) {
 				if (item) {
@@ -917,7 +945,8 @@ export class SimpleFileDialog {
 			const ext = resources.extname(file);
 			for (let i = 0; i < this.options.filters.length; i++) {
 				for (let j = 0; j < this.options.filters[i].extensions.length; j++) {
-					if (ext === ('.' + this.options.filters[i].extensions[j])) {
+					const testExt = this.options.filters[i].extensions[j];
+					if ((testExt === '*') || (ext === ('.' + testExt))) {
 						return true;
 					}
 				}
